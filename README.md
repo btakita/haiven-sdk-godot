@@ -1,0 +1,302 @@
+# Godot spike — GDScript and .NET bindings
+
+## The question
+
+**Does the outbound envelope's discriminant survive the crossing into GDScript,
+and is dynamic typing enough to make it survive for free?**
+
+The two server frames are told apart by the **presence** of `success`, not its
+value (F10). C# needed `bool?` plus an explicit presence check, because a
+non-nullable `bool` maps an absent field to `false` and turns every event into a
+failed reply. GDScript is dynamically typed and `JSON.parse_string` yields a
+`Dictionary`, so the prediction was that presence survives at no cost.
+
+The prediction was half right, which is why it was worth measuring.
+
+## What has been answered
+
+**Presence survives — through `has()`, and only through `has()`.**
+`Dictionary.has("success")` is the GDScript equivalent of C#'s
+`TryGetProperty`, and a binding built on it discriminates correctly.
+
+**But the natural idiom is the broken one.** `frame.get("success")` answers
+`null` for an absent key, and `null` is falsy. So:
+
+```gdscript
+if frame.get("success"):   # WRONG
+```
+
+takes the same branch for *absent* and for *present and false* — which is exactly
+the collapse a non-nullable `bool` causes in C#, in a language that was supposed
+to be immune to it. Dynamic typing did not remove the trap; it moved it from the
+type declaration to the call site, where it is less visible and more idiomatic.
+
+**So the finding generalises rather than being a C# quirk.** The discriminant is
+fragile in every language with a falsy null, and the only correct spelling is an
+explicit presence question. Any binding written against `success` truthiness is
+wrong, and it is wrong in the direction that silently breaks correlation for
+every refused request.
+
+`is_reply` is neutered to the truthy form as a check: it fails exactly one
+assertion, *a refused reply is still a reply*, and Godot exits 1.
+
+## The addon, and what the transport cost
+
+`addons/haiven` is the addon: `plugin.cfg`, the protocol, and a session over
+`WebSocketPeer`. `session_test.gd` drives it against a **real** socket on both
+ends — a `TCPServer` accepts a loopback connection in-process and
+`accept_stream` upgrades it — so the transport under test is the engine's own,
+and no backend is needed.
+
+**No socket abstraction, and none wanted.** `WebSocketPeer` is engine-native and
+takes no injection, so this cannot share the `SocketLike` / `IHaivenSocket` seam.
+It also does not need it: that seam exists because a browser, Electron and
+React Native disagree about what a socket is, and Godot's already works
+everywhere Godot ships.
+
+**Godot charges for it in polling instead.** `WebSocketPeer` has no signals of
+its own — nothing arrives unless someone calls `poll()` — so the session is
+`poll()` in, signals out, and cannot be constructed and left alone the way the
+TypeScript session can.
+
+**The corpus verbs are drivable, but not through the obvious signals.** The
+corpus is pull-shaped (`expect` is "the next frame to arrive") and an idiomatic
+addon is push-shaped, so a runner needs a queue in between. That much was
+expected. What was not: connecting `reply_received` and `event_received` — the
+obvious pair — makes the handshake reply **invisible**, because the session
+consumes `auth.success` and `auth.expired` into its own semantic signals and the
+classified arms are not exhaustive. A runner asserting `expect type:
+auth.success` sees nothing and cannot tell that from a server that sent nothing.
+
+So the addon grew a `frame_received` arm that emits every inbound frame before
+interpreting any of it. One line, and the corpus verbs are expressible. The test
+pins the reason it exists: it asserts the classified arms did **not** see the
+handshake, so the raw arm cannot later be deleted as redundant.
+
+## Game login handoff
+
+`HaivenHandoff` binds the first-party game-login flow to Godot's own primitives:
+`Crypto` supplies two independent 256-bit values, `HashingContext` applies the
+RFC 7636 S256 transform, `OS.shell_open` launches the first-party page, and an
+`HTTPRequest` child performs the form-encoded code exchange. The URL launcher
+and exchange are injectable for console/mobile host adapters and deterministic
+tests; the engine implementations are the defaults. The default exchange has
+`HaivenHttpTransport`'s bounds: a 10 s timeout, an 8 MiB body cap, and no
+redirects. A timed-out exchange fails `complete` with `exchange_timeout`, so the
+game can offer a retry.
+
+```gdscript
+var tokens := HaivenTokenStore.new()
+var handoff := HaivenHandoff.new({
+	"entry_url": "https://app.haiven.gg/connect/game",
+	"exchange_url": "https://api.haiven.gg/v0/auth/handoff/exchange",
+	"integration_id": "my-game",
+	"redirect_url": "my-game://auth/callback",
+}, tokens)
+add_child(handoff) # HTTPRequest needs the scene tree.
+
+var start := handoff.begin_login() # OS.shell_open by default
+
+# Deliver the custom-scheme URI received from the platform integration.
+var result := await handoff.complete(callback_uri)
+
+# The same owner is read again on every WebSocket handshake and re-auth.
+var session := HaivenSession.new(WebSocketPeer.new(), tokens)
+```
+
+Verifier state stays only in the coordinator's memory and is consumed before
+the exchange. Callback scheme, host, port, path, and any query fields configured
+on the redirect must match before state is touched; mismatched, expired,
+cancelled, and replayed transactions cannot reach HTTP. The credential boundary
+accepts only an access token, token type, and relative expiry, converts expiry to
+absolute Unix milliseconds, and rejects any refresh token.
+
+`handoff_test.gd` pins the S256 vector, exact four-field form body, shared
+token-plus-expiry ownership, target/state mismatch, replay, expiry,
+cancellation, and the no-refresh-token boundary in a headless engine run.
+
+## The conformance runner, and what driving the addon cost
+
+`conformance_test.gd` is runner #3 of the published `gaming/v0` corpus, and the
+first one that is **not** a raw socket. The node and dotnet runners drive a bare
+transcript client on purpose, so a bug in the binding cannot mask a server
+assertion. This one drives `addons/haiven` deliberately, because the open
+question was never "does the server answer" — two runners already say yes — but
+whether the signal-based idiom can be driven by the step vocabulary against the
+real thing. `session_test.gd` answered that in miniature with hand-written
+frames; this answers it with the published suite and a real backend.
+
+**It can, and the raw arm is why.** All four scenarios execute and pass through
+the addon. Pointing the runner's queue at `reply_received` / `event_received` —
+the obvious pair — instead of `frame_received` fails seven assertions across
+all four scenarios, every one of them a handshake the session had already
+consumed into `authenticated` / `expired`:
+
+```
+FAIL handshake-succeeds-and-says-nothing-else: expects a auth.success
+FAIL handshake-into-a-lapsed-session-says-so: expects a auth.expired
+FAIL a-reply-is-correlated-to-the-frame-it-answers: expects a auth.success
+```
+
+That is the failure mode worth naming: it is indistinguishable from a server
+that sent nothing. The classified arms are non-exhaustive **by design** — a game
+wants `authenticated`, not a raw handshake frame — so the raw arm is not
+redundancy, it is the only way anything can observe the protocol rather than use
+it.
+
+**`connect` and `auth` are not separable through an idiomatic session.** The
+corpus states them as two steps; an addon handed a token callable handshakes
+itself the moment the socket opens, so the runner defers `connect` and does the
+real work at `auth`, where the token kind is finally known. It refuses any
+scenario shape that would need them apart, rather than pretending. A raw-socket
+runner has no such constraint — which is precisely the difference between
+testing a protocol and testing a binding.
+
+**Request-id correlation costs one injected Callable.** The corpus names a
+request id per step and the addon mints ids internally; driving its `next_id`
+Callable from a variable set before each step is enough. No per-call id argument
+was added — no game would ever pass one.
+
+**The live fixture is not in this repository.** `conformance_test.gd` expects a
+process that prints its bound port on stdout. Godot cannot read that stream,
+and the program that started `the websocket fixture` is not in this
+tree, so `conformance_test.gd` is not a standalone check. The headless scripts
+below are.
+
+## The .NET flavour
+
+`addons/haiven/dotnet` is the C# side of the addon. `GodotWebSocket` is the thin
+engine adapter: it implements the same `IHaivenSocket` seam used by the Unity
+package and turns `WebSocketPeer.poll()` into open, receive, and close events.
+`HaivenDotNetSession` is a scene-tree node that polls it from `_Process` and
+exposes raw-frame, reply, event, authentication, expiry, and close signals.
+
+The protocol and session state machine are not a Godot copy.
+`Haiven.Godot.csproj` references `Haiven.Sdk.Core`, the netstandard2.1 C#
+core in [haiven-sdk-dotnet](https://github.com/haiven-dev/haiven-sdk-dotnet),
+which the Unity package's core also comes from, so both engines use the same
+parsing, first-frame auth, pre-auth queue, correlation, and same-socket re-auth
+behaviour. To build it, clone haiven-sdk-dotnet next to this repository, as
+`../haiven-sdk-dotnet`. The headless C#
+runner proves that shared state machine against an injected socket; the Godot
+project proves the adapter and source-generated signals compile against
+`Godot.NET.Sdk/4.5.1`.
+
+The installed editor is the standard build, not the .NET build, so opening the
+C# node in an engine and making a live connection remain unmeasured. Godot 4 C#
+projects also cannot export to the web; use the GDScript flavour for web targets.
+
+## Still open
+
+The generated REST surface ships as `addons/haiven/haiven_rest_api.gd`, built
+from the public Haiven gaming HTTP API v0 OpenAPI description. The auth handoff
+has measured its structural constraint: `HTTPRequest` is a Node, so
+`HaivenHandoff` is also a Node and must be attached to the scene tree before a
+default exchange. The protocol/session objects remain plain `RefCounted`s.
+
+## Running it
+
+This repository has no Makefile and no test runner script. The checks are the
+headless `*_test.gd` scripts at the repository root, run by the Godot editor.
+The measured editor is Godot **4.5.1 stable**. Godot 4.7.2 is not: its headless
+import reports `Parameter "singleton" is null`.
+
+Import the project once, then run each script:
+
+```sh
+godot --headless --path . --import
+godot --headless --path . --script protocol_test.gd
+godot --headless --path . --script session_test.gd
+```
+
+The same command runs every other `*_test.gd` script. A script passes when it
+exits 0, prints its `HAIVEN_TEST_PASS <suite> <count>` line exactly once, and
+prints no `SCRIPT ERROR:`, `ERROR:`, or `FAIL` line. A script that stops on an
+error never reaches its pass line, so a missing pass line is a failure too.
+
+Four scripts need input this repository does not hold, so they are not
+standalone checks: `conformance_test.gd` (the live fixture described above),
+`client_conformance_test.gd` (a client conformance suite named by
+`HAIVEN_CLIENT_SUITE`), `http_transport_test.gd` (an HTTP fixture named by
+`HAIVEN_HTTP_FIXTURE_BASE_URL`), and `motd_presentation_test.gd` (the MOTD
+presentation contract, read as `res://motd-v1.json`; without that file the
+script reports `ERROR: Parse JSON failed` and does not exit). Haiven runs
+these scripts, with those inputs,
+against Godot 4.5.1 in its own source checks before a change is published to
+this repository.
+
+Release archives are not built in this repository. Haiven's release
+pipeline builds them; see Releases below.
+
+See the
+[Godot command-line reference](https://docs.godotengine.org/en/stable/tutorials/editor/command_line_tutorial.html)
+for `--headless`, `--import`, and `--script`.
+
+## Releases
+
+Releases are published on this repository's
+[GitHub Releases page](https://github.com/haiven-dev/haiven-sdk-godot/releases).
+This repository is published from Haiven's SDK source, and Haiven's release
+pipeline builds and publishes every release from that source after a
+maintainer review. Nothing in this repository cuts a release: there is no
+release workflow, release pull request, or tag to push here.
+
+Each release carries:
+
+- `haiven-godot-addon-<version>.zip`: `addons/haiven/`; unzip it into a Godot
+  project root.
+- `haiven-godot-player-linux-x64-<version>.zip`: the Linux x64 desktop player
+  the `Linux` preset exports. It prints `haiven-sdk-godot` and stays open
+  until closed. It is not a game.
+- `haiven-godot-player-windows-x64-<version>.zip`: the Windows x64 desktop
+  player the `Windows Desktop` preset exports. It is not code-signed.
+- `SHA256SUMS`: the SHA-256 digest of every asset, in `sha256sum` format. Check
+  a download with `sha256sum -c SHA256SUMS`.
+
+The release notes list each asset with its digest and name the source commit
+it was built from. Releases do not attach prebuilt .NET assemblies or a macOS
+player. The C# flavour builds from `Haiven.Godot.csproj` beside a
+haiven-sdk-dotnet checkout (see The .NET flavour above). Earlier releases on
+that page, such as `v0.1.0-preview.1`, predate the pipeline and carry other
+assets, including a prebuilt .NET zip.
+
+Versions follow [Semantic Versioning](https://semver.org/). A release is
+tagged `v<version>`, and in the released addon `version` in
+`addons/haiven/plugin.cfg` and the `X-Haiven-SDK: godot/<version>` header in
+`addons/haiven/haiven_http_transport.gd` carry the same number; the pipeline
+refuses to publish a release whose `plugin.cfg` differs from its tag.
+Haiven's SDK and demo repositories share one version line: the repositories
+in one release carry the same version, and a release can cover only some of
+them, so this repository's version numbers can skip. A version with a
+pre-release suffix (`v1.2.3-rc.1`) is published as a GitHub pre-release and
+is never marked Latest.
+
+Leave the `plugin.cfg` version and the `X-Haiven-SDK` header, including their
+`x-release-please` marker comments, to Haiven's release process; a pull
+request here does not choose a version.
+
+Source updates arrive as pull requests into `main`. Contributions are
+welcome as pull requests here too; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Haiven's maintainers carry each accepted change into Haiven's source, so later
+updates keep it.
+
+<!-- features:start (generated by codegen/features.py; do not edit) -->
+
+### Feature coverage
+
+| Family | Godot |
+|---|:---:|
+| Envelope | ~ |
+| Session lifecycle | ~ |
+| Request recovery | ✅ |
+| Open vocabularies | ~ |
+| REST | ○ |
+| Game login handoff | ○ |
+| P2P sessions | ○ |
+| API surface | ✅ |
+| Product | ~ |
+| Developer experience | ~ |
+
+✅ shipped · `↑` inherited from the language SDK this target ships, proven only in that SDK's runner and not inside the engine · `~` partial · `—` absent · `○` not yet proven by any scenario · `⊘` not applicable. A family cell is ✅ only when every counted row is ✅, and `↑` when every counted row is ✅ or `↑`; `MAY` requirements and rows marked optional are not counted. Every row: the full Haiven SDK feature matrix.
+
+<!-- features:end -->
